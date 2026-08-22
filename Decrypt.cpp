@@ -894,9 +894,16 @@ extern "C" bool Decrypt_User(const userid_t user_id, const std::string& Password
 	}
     std::string filename;
     bool Default_Password = (Password == "!");
-    if (Get_Password_Type(user_id, filename) == 0 && !Default_Password) {
-		printf("Unknown password type\n");
-		return false;
+    int pwd_type = Get_Password_Type(user_id, filename);
+    if (pwd_type == 0 && !Default_Password) {
+		// On Android 12+, gatekeeper.password.key doesn't exist.
+		// If spblob exists, try synthetic password even if type detection failed.
+		if (stat("/data/system_de/0/spblob", &st) == 0) {
+			printf("Password type unknown but spblob found, trying synthetic password\n");
+		} else {
+			printf("Unknown password type\n");
+			return false;
+		}
 	}
 
 	if (Default_Password) {
