@@ -896,14 +896,12 @@ extern "C" bool Decrypt_User(const userid_t user_id, const std::string& Password
     bool Default_Password = (Password == "!");
     int pwd_type = Get_Password_Type(user_id, filename);
     if (pwd_type == 0 && !Default_Password) {
-		// On Android 12+, gatekeeper.password.key doesn't exist.
-		// If spblob exists, try synthetic password even if type detection failed.
-		if (stat("/data/system_de/0/spblob", &st) == 0) {
-			printf("Password type unknown but spblob found, trying synthetic password\n");
-		} else {
-			printf("Unknown password type\n");
-			return false;
-		}
+		// On Android 12+, gatekeeper.password.key doesn't exist and all
+		// passwords are synthetic. Always try synthetic password path
+		// regardless of whether we can stat spblob (fscrypt filename
+		// encryption may prevent stat even though files are readable).
+		printf("Password type unknown (%d), trying synthetic password path\n", pwd_type);
+		return Decrypt_User_Synth_Pass(user_id, Password);
 	}
 
 	if (Default_Password) {
@@ -911,6 +909,11 @@ extern "C" bool Decrypt_User(const userid_t user_id, const std::string& Password
 			return Decrypt_User_Synth_Pass(user_id, Password);
 		}
 		return true;
+	}
+	if (pwd_type == 3 || pwd_type == 1) {
+		// PIN or pattern — use synthetic password method (Android 12+)
+		printf("Using synthetic password method for type %d\n", pwd_type);
+		return Decrypt_User_Synth_Pass(user_id, Password);
 	}
 	if (stat("/data/system_de/0/spblob", &st) == 0) {
 		printf("Using synthetic password method\n");
