@@ -16,6 +16,7 @@
 
 #include "Decrypt.h"
 #include "FsCrypt.h"
+#include "Keymaster.h"
 #include <fscrypt/fscrypt.h>
 
 #include <map>
@@ -528,40 +529,98 @@ namespace keystore {
 			::ndk::SpAIBinder keystoreBinder(AServiceManager_checkService("android.system.keystore2.IKeystoreService/default"));
 			auto keystore = ks2::IKeystoreService::fromBinder(keystoreBinder);
 			auto rc = keystore->getKeyEntry(keyDescriptor(keystore_alias), &keyEntryResponse);
+
+			std::string keystore_result_str;
+
 			if (!rc.isOk()) {
 				auto error = unwrapError(rc);
 				if (ks2::ResponseCode(error) == ks2::ResponseCode::KEY_NOT_FOUND) {
-					printf("key not found\n");
+					printf("key not found in keystore2, trying legacy keystore blob\n");
+					// Legacy keystore fallback: read USRPKEY blob directly from
+					// /data/misc/keystore/user_0/ and feed the raw keymaster blob
+					// to keymint via ks2::Domain::BLOB (bypasses persistent.sqlite)
+					std::string legacy_path = "/data/misc/keystore/user_0/1000_USRPKEY_" + keystore_alias;
+					std::string legacy_blob;
+					if (!android::base::ReadFileToString(legacy_path, &legacy_blob)) {
+						printf("failed to read legacy keystore blob: %s\n", legacy_path.c_str());
+						return disk_decryption_secret_key;
+					}
+					const unsigned char* blob_data = (const unsigned char*)legacy_blob.data();
+					if (legacy_blob.size() < 40) {
+						printf("legacy keystore blob too small (%zu bytes)\n", legacy_blob.size());
+						return disk_decryption_secret_key;
+					}
+					uint8_t blob_version = blob_data[0];
+					uint8_t blob_flags = blob_data[2];
+					uint32_t blob_length = ((uint32_t)blob_data[36] << 24) |
+						((uint32_t)blob_data[37] << 16) |
+						((uint32_t)blob_data[38] << 8) |
+						((uint32_t)blob_data[39]);
+					printf("legacy blob: version=%d type=%d flags=0x%02x length=%u\n",
+						blob_version, blob_data[1], blob_flags, blob_length);
+					if (blob_version != 3) {
+						printf("unsupported legacy blob version %d\n", blob_version);
+						return disk_decryption_secret_key;
+					}
+					if (blob_flags & 0x01) {
+						// FLAG_ENCRYPTED — blob is encrypted with .masterkey, not supported yet
+						printf("legacy blob is encrypted (flags=0x%02x), not supported\n", blob_flags);
+						return disk_decryption_secret_key;
+					}
+					if (40 + blob_length > legacy_blob.size()) {
+						printf("blob_length %u exceeds file size %zu\n", blob_length, legacy_blob.size());
+						return disk_decryption_secret_key;
+					}
+					// Raw keymaster blob starts at offset 40
+					std::string raw_km_blob(legacy_blob, 40, blob_length);
+					printf("raw keymaster blob: %zu bytes, feeding to keymint via BLOB domain\n", raw_km_blob.size());
+					android::vold::Keymaster km;
+					if (!km) {
+						printf("failed to initialize Keymaster for legacy blob\n");
+						return disk_decryption_secret_key;
+					}
+					keymint::AuthorizationSet km_out_params;
+					auto km_op = km.begin(raw_km_blob, begin_params, &km_out_params);
+					if (!km_op) {
+						printf("Keymaster::begin with legacy blob failed (error=%d)\n", (int)km_op.getErrorCode());
+						return disk_decryption_secret_key;
+					}
+					if (!km_op.finish(&keystore_result_str)) {
+						printf("Keymaster::finish with legacy blob failed\n");
+						return disk_decryption_secret_key;
+					}
+					printf("legacy keystore decrypt success: %zu bytes\n", keystore_result_str.size());
 				} else {
 					printf("Failed to get key entry: %s\n", rc.getDescription().c_str());
+					return disk_decryption_secret_key;
 				}
-				return disk_decryption_secret_key;
+			} else {
+				std::variant<int, ks2::KeyEntryResponse> response = keyEntryResponse;
+				auto keyResponse = std::get<ks2::KeyEntryResponse>(response);
+				ks2::CreateOperationResponse encOperationResponse;
+				auto begin_rc = keyResponse.iSecurityLevel->createOperation(
+					keyResponse.metadata.key, begin_params.vector_data(), true,
+					&encOperationResponse);
+				if (!begin_rc.isOk()) {
+					printf("Begin Operation failed\n");
+					return disk_decryption_secret_key;
+				}
+				std::optional<std::vector<uint8_t>> optPlaintext;
+				begin_rc = encOperationResponse.iOperation->finish(cipher_text_hidlvec, {}, &optPlaintext);
+				if (!begin_rc.isOk()) {
+					printf("finish reponse failed\n");
+					return disk_decryption_secret_key;
+				}
+				keystore_result_str = std::string(optPlaintext->begin(), optPlaintext->end());
 			}
-			std::variant<int, ks2::KeyEntryResponse> response = keyEntryResponse;
-			auto keyResponse = std::get<ks2::KeyEntryResponse>(response);
-			ks2::CreateOperationResponse encOperationResponse;
-			auto begin_rc = keyResponse.iSecurityLevel->createOperation(
-				keyResponse.metadata.key, begin_params.vector_data(), true,
-				&encOperationResponse);
-			if (!begin_rc.isOk()) {
-				printf("Begin Operation failed\n");
-				return disk_decryption_secret_key;
-			}
-			std::optional<std::vector<uint8_t>> optPlaintext;
 
-			begin_rc = encOperationResponse.iOperation->finish(cipher_text_hidlvec, {}, &optPlaintext);
-			if (!begin_rc.isOk()) {
-				printf("finish reponse failed");
-				return disk_decryption_secret_key;
-			}
-
-			size_t keystore_result_size = optPlaintext->size();
+			size_t keystore_result_size = keystore_result_str.size();
 			unsigned char* keystore_result = (unsigned char*)malloc(keystore_result_size);
 			if (!keystore_result) {
 				printf("malloc on keystore_result\n");
 				return disk_decryption_secret_key;
 			}
-			memcpy(keystore_result, &optPlaintext->front(), keystore_result_size);
+			memcpy(keystore_result, keystore_result_str.data(), keystore_result_size);
 
 			const unsigned char* intermediate_iv = keystore_result;
 			// printf("intermediate_iv: "); output_hex((const unsigned char*)intermediate_iv, 12); printf("\n");
