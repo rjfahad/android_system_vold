@@ -428,10 +428,33 @@ namespace keystore {
 		std::string keystore_path = "/tmp/misc/keystore/";
 		std::string dst = keystore_path + "persistent.sqlite";
 		std::string src = "/data/misc/keystore/persistent.sqlite";
+		struct stat src_st, dst_st;
+		bool have_src = (stat(src.c_str(), &src_st) == 0 && src_st.st_size > 0);
+		bool have_dst = (stat(dst.c_str(), &dst_st) == 0);
+		if (!have_src) {
+			printf("copySqliteDb: source '%s' missing or empty, skipping\n", src.c_str());
+			return;
+		}
+		if (have_dst && dst_st.st_size == src_st.st_size) {
+			printf("copySqliteDb: '%s' already up to date (%lld bytes)\n", dst.c_str(), (long long)dst_st.st_size);
+			return;
+		}
+		// Ensure destination directory exists (init.rc normally creates it,
+		// but be defensive).
+		mkdir(keystore_path.c_str(), 0755);
 		std::ifstream srcif(src.c_str(), std::ios::binary);
-		std::ofstream dstof(dst.c_str(), std::ios::binary);
+		std::ofstream dstof(dst.c_str(), std::ios::binary | std::ios::trunc);
+		if (!srcif.is_open() || !dstof.is_open()) {
+			printf("copySqliteDb: failed to open streams for copy\n");
+			return;
+		}
 		printf("copying '%s' to '%s'\n", src.c_str(), dst.c_str());
 		dstof << srcif.rdbuf();
+		if (stat(dst.c_str(), &dst_st) == 0 && dst_st.st_size == src_st.st_size) {
+			printf("copySqliteDb: copied %lld bytes successfully\n", (long long)src_st.st_size);
+		} else {
+			printf("copySqliteDb: WARNING size mismatch after copy\n");
+		}
 		srcif.close();
 		dstof.close();
 	}
